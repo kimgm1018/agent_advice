@@ -4,20 +4,88 @@ from .agent_data import AGENT_PROFILES
 from .pricing_data import API_MODELS, SUBSCRIPTION_PLANS
 
 
-def _calculate_api_cost(token_range: tuple[int, int], api_model_name: str) -> float:
+def _get_api_model(api_model_name: str) -> dict[str, Any] | None:
     model = next((item for item in API_MODELS if item["name"] == api_model_name), None)
     if not model:
+        return None
+    if model.get("price_confidence") != "high":
+        return None
+    return model
+
+
+def _token_cost(
+    model: dict[str, Any],
+    uncached_input_tokens: float,
+    cache_read_tokens: float,
+    cache_write_tokens: float,
+    output_tokens: float,
+    search_calls: float = 0.0,
+    runtime_hours: float = 0.0,
+    deploy_runs: float = 0.0,
+) -> float:
+    # C_request = Tin_uncached*pin + Tin_cache_read*pcache_read + Tin_cache_write*pcache_write
+    #            + Tout*pout + Nsearch*psearch + Hruntime*pruntime + Ndeploy*pdeploy
+    input_cost = (uncached_input_tokens / 1_000_000) * float(model["input_per_1m"])
+    output_cost = (output_tokens / 1_000_000) * float(model["output_per_1m"])
+    cache_read_cost = 0.0
+    cache_write_cost = 0.0
+    search_cost = 0.0
+    runtime_cost = 0.0
+    deploy_cost = 0.0
+
+    if model.get("cache_read_per_1m") is not None:
+        cache_read_cost = (cache_read_tokens / 1_000_000) * float(model["cache_read_per_1m"])
+    if model.get("cache_write_per_1m") is not None:
+        cache_write_cost = (cache_write_tokens / 1_000_000) * float(model["cache_write_per_1m"])
+    if model.get("search_per_1k") is not None:
+        search_cost = (search_calls / 1_000) * float(model["search_per_1k"])
+    if model.get("runtime_per_hour") is not None:
+        runtime_cost = runtime_hours * float(model["runtime_per_hour"])
+    if model.get("deploy_per_run") is not None:
+        deploy_cost = deploy_runs * float(model["deploy_per_run"])
+
+    return round(input_cost + cache_read_cost + cache_write_cost + output_cost + search_cost + runtime_cost + deploy_cost, 2)
+
+
+def _calculate_api_cost(
+    token_range: tuple[int, int],
+    api_model_name: str,
+    *,
+    cache_hit_rate: float,
+    cache_write_rate: float,
+    search_calls: float,
+    runtime_hours: float,
+    deploy_runs: float,
+) -> float:
+    model = _get_api_model(api_model_name)
+    if not model:
         return 999.0
+
     avg_total_tokens = (token_range[0] + token_range[1]) / 2
-    input_tokens = avg_total_tokens * 0.65
+    input_tokens = avg_total_tokens * 0.7
     output_tokens = avg_total_tokens * 0.35
-    input_cost = (input_tokens / 1_000_000) * model["input_per_1m"]
-    output_cost = (output_tokens / 1_000_000) * model["output_per_1m"]
-    return round(input_cost + output_cost, 2)
+    input_tokens = input_tokens * 0.95  # 메시지 압축/요약 적용 가정
+
+    uncached_input_tokens = input_tokens * (1 - cache_hit_rate)
+    cache_read_tokens = input_tokens * cache_hit_rate
+    cache_write_tokens = input_tokens * cache_write_rate
+
+    return _token_cost(
+        model,
+        uncached_input_tokens=uncached_input_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+        output_tokens=output_tokens,
+        search_calls=search_calls,
+        runtime_hours=runtime_hours,
+        deploy_runs=deploy_runs,
+    )
 
 
 def _calculate_subscription_cost(name: str) -> float:
     plan = next((item for item in SUBSCRIPTION_PLANS if item["name"] == name), None)
+    if plan and plan.get("price_confidence") != "high":
+        return 999.0
     return float(plan["monthly_fee"]) if plan else 999.0
 
 
@@ -74,13 +142,66 @@ def recommend_agents(
     complexity_score: float,
     extracted_features: list[str],
     requirements_count: int,
+    requirements: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     recommendations = []
+    requirement_units = requirements or []
+
+    # 토큰화/과금 규칙(보고서 수식 적용)
+    # T_in^(n)=T_sys+T_memory+sum(turns)+T_retrieval+T_files
+    base_requirement_input = sum(float(req.get("estimatedInputTokens", 0)) for req in requirement_units)
+    base_requirement_output = sum(float(req.get("estimatedOutputTokens", 0)) for req in requirement_units)
+    t_sys = 1200.0
+    t_memory = 800.0
+    t_retrieval = 500.0 * max(1, requirements_count // 2)
+    t_files = 200.0 * requirements_count
+    t_toolcall = base_requirement_input * 0.08
+    t_toolresult = base_requirement_output * 0.12
+
+    t_in_formula = t_sys + t_memory + base_requirement_input + t_toolcall + t_toolresult + t_retrieval + t_files
+
     for agent in AGENT_PROFILES:
-        base_build_cost = _calculate_api_cost(token_range, agent["api_model_name"]) if agent.get("api_model_name") else 0.0
+        cache_hit_rate = 0.4 if agent["mode"] in {"subscription", "hybrid"} else 0.28
+        cache_write_rate = 0.12
+        search_calls = max(0.0, requirements_count * 0.18)
+        runtime_hours = max(0.0, requirements_count * 0.04)
+        deploy_runs = max(0.0, requirements_count * 0.15)
+
+        # 수식 기반 입력 토큰을 기존 범위와 평균해 안정화
+        formula_token_range = (max(50_000, int(t_in_formula * 0.85)), max(120_000, int(t_in_formula * 1.7)))
+        blended_token_range = (
+            int((token_range[0] + formula_token_range[0]) / 2),
+            int((token_range[1] + formula_token_range[1]) / 2),
+        )
+
+        base_build_cost = (
+            _calculate_api_cost(
+                blended_token_range,
+                agent["api_model_name"],
+                cache_hit_rate=cache_hit_rate,
+                cache_write_rate=cache_write_rate,
+                search_calls=search_calls,
+                runtime_hours=runtime_hours,
+                deploy_runs=deploy_runs,
+            )
+            if agent.get("api_model_name")
+            else 0.0
+        )
         subscription_cost = _calculate_subscription_cost(agent["subscription_name"]) if agent.get("subscription_name") else 0.0
         overhead_tokens = _overhead_token_range(token_range, agent["mode"], requirements_count)
-        overhead_cost = _calculate_api_cost(overhead_tokens, agent["api_model_name"]) if agent.get("api_model_name") else 0.0
+        overhead_cost = (
+            _calculate_api_cost(
+                overhead_tokens,
+                agent["api_model_name"],
+                cache_hit_rate=cache_hit_rate,
+                cache_write_rate=cache_write_rate,
+                search_calls=0.0,
+                runtime_hours=runtime_hours * 0.4,
+                deploy_runs=0.0,
+            )
+            if agent.get("api_model_name")
+            else 0.0
+        )
         total_cost = round(base_build_cost + overhead_cost + subscription_cost, 2)
 
         breakdown = {
@@ -118,6 +239,7 @@ def recommend_agents(
                     f"강점: {', '.join(agent['strengths'][:2])}",
                     f"예상 총비용: ${total_cost:.2f} (구현 API + Agent 오버헤드 API + 구독 합산)",
                     f"추출 기능 수: {len(extracted_features)}, 요구사항 유닛 수: {requirements_count}",
+                    f"토큰식 입력 추정 T_in≈{int(t_in_formula):,}, 캐시 hit≈{int(cache_hit_rate*100)}%",
                 ],
             }
         )

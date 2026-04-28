@@ -52,6 +52,17 @@ NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000
 - 2단계: 요구사항 유닛별 토큰 추정 (입력/출력 토큰)
 - 통합: 유닛 토큰 합산 + 불확실성 계수 반영으로 최종 토큰 범위/복잡도 계산
 - 비용: 구현 API 비용 + Agent 오케스트레이션 추가 API 비용 + 구독 비용을 합산
+- 가격 반영 정책: `high confidence` 항목만 계산에 사용하고, 동적/문의형/공개 단가 불충분 항목은 제외
+
+## 토큰/과금 수식
+
+백엔드는 아래 형태의 수식을 사용해 토큰과 비용을 계산합니다.
+
+- `T_in = T_sys + T_memory + Σ(turns) + T_toolcall + T_toolresult + T_retrieval + T_files`
+- `T_in,total = T_uncached + T_cache_read + T_cache_write`
+- `C = T_uncached*p_in + T_cache_read*p_cache_read + T_cache_write*p_cache_write + T_out*p_out + N_search*p_search + H_runtime*p_runtime + N_deploy*p_deploy`
+
+공급자별 캐시/검색/런타임 단가가 없으면 해당 항은 0으로 처리합니다.
 
 ## 테스트
 
@@ -93,6 +104,7 @@ npm run test
   "complexityScore": 63.4,
   "projectAnalysisRationale": "요구사항 유닛별 토큰을 합산하고 불확실성을 반영해 추정했습니다.",
   "pricingEffectiveDate": "2026-04-28",
+  "pricingConfidencePolicy": "high_only",
   "recommendations": [
     {
       "name": "Cursor Agent",

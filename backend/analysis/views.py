@@ -4,7 +4,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .graph_service import analyze_project_with_langgraph
-from .pricing_data import PRICING_EFFECTIVE_DATE
+from .pricing_data import EXCLUDED_PRICING_ITEMS, PRICING_CONFIDENCE_POLICY, PRICING_EFFECTIVE_DATE
 from .recommender_service import recommend_agents
 from .serializers import AnalyzeRequestSerializer
 
@@ -26,6 +26,7 @@ class AnalyzeView(APIView):
                 complexity_score=float(analysis["complexityScore"]),
                 extracted_features=list(analysis["extractedFeatures"]),
                 requirements_count=len(analysis["requirements"]),
+                requirements=list(analysis["requirements"]),
             )
             payload = {
                 "tokens": [token_range[0], token_range[1]],
@@ -35,6 +36,8 @@ class AnalyzeView(APIView):
                 "complexityScore": analysis["complexityScore"],
                 "projectAnalysisRationale": analysis["rationale"],
                 "pricingEffectiveDate": PRICING_EFFECTIVE_DATE,
+                "pricingConfidencePolicy": PRICING_CONFIDENCE_POLICY,
+                "excludedPricingItems": EXCLUDED_PRICING_ITEMS,
                 "recommendations": recommendations,
             }
             return Response(payload, status=status.HTTP_200_OK)

@@ -45,6 +45,21 @@ class GraphState(TypedDict, total=False):
     uncertainty_factor: float
 
 
+def _complexity_token_floor(complexity: str) -> tuple[int, int]:
+    if complexity == "high":
+        return 130_000, 60_000
+    if complexity == "medium":
+        return 70_000, 30_000
+    return 25_000, 12_000
+
+
+def _normalize_requirement_token_unit(req: dict[str, Any]) -> tuple[int, int]:
+    floor_in, floor_out = _complexity_token_floor(str(req.get("complexity", "low")))
+    est_in = int(req.get("estimatedInputTokens", 0))
+    est_out = int(req.get("estimatedOutputTokens", 0))
+    return max(est_in, floor_in), max(est_out, floor_out)
+
+
 def _llm() -> ChatOpenAI:
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY가 설정되지 않았습니다. 프로젝트 루트 .env.local 또는 백엔드 환경변수에 설정해주세요.")
@@ -52,11 +67,14 @@ def _llm() -> ChatOpenAI:
 
 
 def aggregate_requirement_tokens(requirements: list[dict[str, Any]], uncertainty_factor: float) -> tuple[int, int, float]:
-    total_input = sum(int(req["estimatedInputTokens"]) for req in requirements)
-    total_output = sum(int(req["estimatedOutputTokens"]) for req in requirements)
+    normalized_units = [_normalize_requirement_token_unit(req) for req in requirements]
+    total_input = sum(unit[0] for unit in normalized_units)
+    total_output = sum(unit[1] for unit in normalized_units)
     base_total = total_input + total_output
-    token_min = max(80_000, round(base_total * 0.95))
-    token_max = max(token_min + 50_000, round(base_total * uncertainty_factor))
+
+    iteration_multiplier = 1.0 + min(2.4, len(requirements) * 0.18)
+    token_min = round(base_total * iteration_multiplier)
+    token_max = round(token_min * max(1.2, uncertainty_factor))
 
     high_count = len([req for req in requirements if req["complexity"] == "high"])
     medium_count = len([req for req in requirements if req["complexity"] == "medium"])
@@ -105,10 +123,18 @@ def estimate_tokens_node(state: GraphState) -> GraphState:
 
     result = llm.invoke(
         [
-            ("system", "너는 AI 코딩 비용 견적 전문가다. 각 요구사항별 입력/출력 토큰을 추정해라."),
+            (
+                "system",
+                "너는 AI 코딩 비용 견적 전문가다. 공급자별 토큰화 규칙(대략 1 token≈4 chars)과 "
+                "멀티턴 누적 문맥, tool call/result 오버헤드를 반영해 각 요구사항별 입력/출력 토큰을 추정해라.",
+            ),
             (
                 "user",
                 f"프로젝트 유형: {state['project_type']}\n요구사항: {req_for_prompt}\n"
+                "규칙:\n"
+                "- estimatedInputTokens에는 system/memory/retrieval/toolcall prefix 재사용분을 포함\n"
+                "- estimatedOutputTokens에는 thinking/도구결과요약으로 인한 초과 출력 가능성을 반영\n"
+                "- 과도한 추정은 피하고, 구현/디버깅/리팩터링 반복을 반영\n"
                 "각 유닛별 estimatedInputTokens, estimatedOutputTokens를 정수로 반환해라.",
             ),
         ]
@@ -118,11 +144,12 @@ def estimate_tokens_node(state: GraphState) -> GraphState:
     updated_requirements = []
     for req in state["requirements"]:
         unit = unit_map.get(req["name"])
+        floor_in, floor_out = _complexity_token_floor(req["complexity"])
         updated_requirements.append(
             {
                 **req,
-                "estimatedInputTokens": int(unit.estimatedInputTokens if unit else 25_000),
-                "estimatedOutputTokens": int(unit.estimatedOutputTokens if unit else 12_000),
+                "estimatedInputTokens": max(int(unit.estimatedInputTokens if unit else floor_in), floor_in),
+                "estimatedOutputTokens": max(int(unit.estimatedOutputTokens if unit else floor_out), floor_out),
             }
         )
 

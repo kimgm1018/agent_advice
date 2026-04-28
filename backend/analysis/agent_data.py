@@ -23,7 +23,7 @@ AGENT_PROFILES = [
     {
         "name": "OpenAI API Agent Stack",
         "mode": "api",
-        "api_model_name": "OpenAI GPT-4.1 mini API",
+        "api_model_name": "OpenAI GPT-5.4 mini API",
         "strengths": ["함수 호출 중심 자동화", "툴 연계", "대량 요청 처리"],
         "autonomy": 7.8,
         "context_handling": 7.6,
@@ -33,7 +33,7 @@ AGENT_PROFILES = [
     {
         "name": "Gemini API Agent Stack",
         "mode": "api",
-        "api_model_name": "Google Gemini 2.5 Flash API",
+        "api_model_name": "Google Gemini 2.5 Flash Flex API",
         "strengths": ["저비용 대량 처리", "빠른 응답", "고빈도 반복 작업"],
         "autonomy": 7.2,
         "context_handling": 7.4,
